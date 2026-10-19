@@ -10,6 +10,10 @@ on:
         description: '强制重新部署最新版'
         type: boolean
         default: false
+      tg_test:
+        description: '只发一条 TG 测试消息'
+        type: boolean
+        default: false
 
 concurrency:
   group: sap-newapi-update
@@ -34,8 +38,29 @@ jobs:
       SAP_PASSWORD: ${{ secrets.SAP_PASSWORD }}
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
     steps:
+      - name: 读取 env-config 中的 TG 配置（可选）
+        if: env.PRIVATE_REPO_TOKEN != '' && env.TG_BOT_TOKEN == ''
+        continue-on-error: true
+        run: |
+          f=$(curl -fsSL -H "Authorization: Bearer $PRIVATE_REPO_TOKEN" -H "Accept: application/vnd.github.raw" \
+            https://api.github.com/repos/gxjxzhoo/env-config/contents/.env) || exit 0
+          for k in TG_BOT_TOKEN TG_CHAT_ID; do
+            v=$(printf '%s\n' "$f" | grep -E "^$k=" | head -1 | cut -d= -f2-)
+            [ -n "$v" ] && { echo "::add-mask::$v"; echo "$k=$v" >> "$GITHUB_ENV"; }
+          done
+          echo "已从 env-config 读取 TG 配置"
+
+      - name: TG 测试
+        if: inputs.tg_test
+        run: |
+          [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || { echo "::error::TG 未配置"; exit 1; }
+          curl -sS "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" -d chat_id="$TG_CHAT_ID" \
+            -d text="🔔 SAP new-api 自动更新 TG 测试" | jq -r 'if .ok then "已发送" else "失败: \(.description)" end'
+
       - name: 同步上游 (fork sync)
+        if: ${{ !inputs.tg_test }}
         continue-on-error: true   # 上游改了 workflow 文件时 GITHUB_TOKEN 无权同步，不影响部署判断
         env:
           GH_TOKEN: ${{ github.token }}
@@ -44,6 +69,7 @@ jobs:
 
       - name: 查询上游最新版本
         id: upstream
+        if: ${{ !inputs.tg_test }}
         run: |
           TAG=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
             "https://api.github.com/repos/$UPSTREAM/releases/latest" | jq -r .tag_name)
@@ -103,11 +129,14 @@ jobs:
       - name: Telegram 通知
         if: always() && steps.current.outputs.need == 'true'
         run: |
-          [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || exit 0
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "::warning::TG 未配置（需要 TG_BOT_TOKEN/TG_CHAT_ID Secret，或 PRIVATE_REPO_TOKEN 读取 env-config），跳过通知"
+            exit 0
+          fi
           if [ "${{ steps.push.outcome }}" = "success" ]; then
             MSG="✅ <b>SAP new-api 已更新</b>%0A版本: ${{ steps.upstream.outputs.tag }}%0A原镜像: ${{ steps.current.outputs.image }}"
           else
             MSG="❌ <b>SAP new-api 更新失败</b>%0A目标版本: ${{ steps.upstream.outputs.tag }}%0A请查看 Actions 日志"
           fi
           curl -fsS "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-            -d chat_id="$TG_CHAT_ID" -d parse_mode=HTML -d text="$MSG" >/dev/null
+            -d chat_id="$TG_CHAT_ID" -d parse_mode=HTML -d text="$MSG" | jq -r 'if .ok then "TG 通知已发送" else "TG 发送失败: \(.description)" end'
