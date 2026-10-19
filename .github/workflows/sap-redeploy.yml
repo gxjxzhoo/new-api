@@ -11,14 +11,9 @@ on:
         description: 'Docker 镜像（docker 应用用；buildpack 应用直接 restage）'
         required: false
         default: gxjxzgx/danmu-api:latest
-      url:
-        description: '健康检查 URL'
-        required: false
-        default: https://danmuapi.cert.cfapps.ap21.hana.ondemand.com
 
 env:
   CF_API: https://api.cf.ap21.hana.ondemand.com
-  CF_ORG: 1366518btrial
   CF_SPACE: dev
 
 jobs:
@@ -31,14 +26,18 @@ jobs:
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       APP: ${{ inputs.app }}
       IMG: ${{ inputs.image }}
-      URL: ${{ inputs.url }}
     steps:
       - name: 安装 cf CLI 并登录
         run: |
           curl -fsSL "https://packages.cloudfoundry.org/stable?release=linux64-binary&version=v8&source=github" | sudo tar -zx -C /usr/local/bin cf8 cf
           cf api "$CF_API"
           CF_USERNAME="$SAP_EMAIL" CF_PASSWORD="$SAP_PASSWORD" cf auth
-          cf target -o "$CF_ORG" -s "$CF_SPACE"
+          ORG=$(cf curl /v3/organizations | jq -r '.resources[0].name')
+          echo "::add-mask::$ORG"
+          cf target -o "$ORG" -s "$CF_SPACE" >/dev/null && echo "已选择 space $CF_SPACE"
+          HOST=$(cf curl "/v3/apps/$(cf app "$APP" --guid)/routes" | jq -r '.resources[0].url')
+          echo "::add-mask::$HOST"
+          echo "URL=https://$HOST" >> "$GITHUB_ENV"
 
       - name: 当前状态
         id: cur
