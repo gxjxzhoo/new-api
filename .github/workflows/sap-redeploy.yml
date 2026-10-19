@@ -1,0 +1,75 @@
+name: SAP redeploy app (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: 'CF 应用名'
+        required: true
+        default: danmuapi
+      image:
+        description: 'Docker 镜像（docker 应用用；buildpack 应用直接 restage）'
+        required: false
+        default: gxjxzgx/danmu-api:latest
+      url:
+        description: '健康检查 URL'
+        required: false
+        default: https://danmuapi.cert.cfapps.ap21.hana.ondemand.com
+
+env:
+  CF_API: https://api.cf.ap21.hana.ondemand.com
+  CF_ORG: 1366518btrial
+  CF_SPACE: dev
+
+jobs:
+  redeploy:
+    runs-on: ubuntu-24.04
+    env:
+      SAP_EMAIL: ${{ secrets.SAP_EMAIL }}
+      SAP_PASSWORD: ${{ secrets.SAP_PASSWORD }}
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      APP: ${{ inputs.app }}
+      IMG: ${{ inputs.image }}
+      URL: ${{ inputs.url }}
+    steps:
+      - name: 安装 cf CLI 并登录
+        run: |
+          curl -fsSL "https://packages.cloudfoundry.org/stable?release=linux64-binary&version=v8&source=github" | sudo tar -zx -C /usr/local/bin cf8 cf
+          cf api "$CF_API"
+          CF_USERNAME="$SAP_EMAIL" CF_PASSWORD="$SAP_PASSWORD" cf auth
+          cf target -o "$CF_ORG" -s "$CF_SPACE"
+
+      - name: 当前状态
+        id: cur
+        run: |
+          GUID=$(cf app "$APP" --guid)
+          LC=$(cf curl "/v3/apps/$GUID" | jq -r .lifecycle.type)
+          CUR=$(cf curl "/v3/apps/$GUID/droplets/current" | jq -r '.image // .buildpacks[0].name // ""')
+          echo "lifecycle=$LC" >> "$GITHUB_OUTPUT"
+          echo "当前: lifecycle=$LC  image/buildpack=$CUR"
+          cf app "$APP"
+
+      - name: 重新部署（滚动）
+        id: deploy
+        run: |
+          if [ "${{ steps.cur.outputs.lifecycle }}" = "docker" ] && [ -n "$IMG" ]; then
+            cf push "$APP" --docker-image "$IMG" --strategy rolling
+          else
+            cf restage "$APP" --strategy rolling
+          fi
+          code=000
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 30 "$URL" || true)
+            [ "$code" = "200" ] && break; sleep 10
+          done
+          cf app "$APP"
+          [ "$code" = "200" ] || { echo "::error::部署后访问异常 $code"; exit 1; }
+
+      - name: Telegram 通知
+        if: always() && steps.deploy.outcome != 'skipped'
+        run: |
+          [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || exit 0
+          if [ "${{ steps.deploy.outcome }}" = "success" ]; then S="✅ SAP $APP 重新部署成功"; else S="❌ SAP $APP 重新部署失败"; fi
+          curl -sS "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" -d chat_id="$TG_CHAT_ID" \
+            --data-urlencode text="$S（镜像: ${IMG:-restage}）" | jq -r '.ok'
