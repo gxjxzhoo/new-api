@@ -1,0 +1,43 @@
+name: SAP map route (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: 'CF 应用名'
+        required: true
+        default: danmuapi
+      hostname:
+        description: '子域名（hostname）'
+        required: true
+        default: danmuapi
+      domain:
+        description: '共享域名'
+        required: true
+        default: cfapps.ap21.hana.ondemand.com
+
+env:
+  CF_API: https://api.cf.ap21.hana.ondemand.com
+  CF_SPACE: dev
+
+jobs:
+  map:
+    runs-on: ubuntu-24.04
+    env:
+      SAP_EMAIL: ${{ secrets.SAP_EMAIL }}
+      SAP_PASSWORD: ${{ secrets.SAP_PASSWORD }}
+    steps:
+      - name: 登录并添加路由
+        run: |
+          set -e
+          curl -fsSL "https://packages.cloudfoundry.org/stable?release=linux64-binary&version=v8&source=github" | sudo tar -zx -C /usr/local/bin cf8 cf
+          cf api "$CF_API" >/dev/null
+          CF_USERNAME="$SAP_EMAIL" CF_PASSWORD="$SAP_PASSWORD" cf auth >/dev/null
+          ORG=$(cf curl /v3/organizations | jq -r '.resources[0].name'); echo "::add-mask::$ORG"
+          cf target -o "$ORG" -s "$CF_SPACE" >/dev/null
+          cf map-route "${{ inputs.app }}" "${{ inputs.domain }}" --hostname "${{ inputs.hostname }}"
+          GUID=$(cf app "${{ inputs.app }}" --guid)
+          cf curl "/v3/apps/$GUID/routes" | jq -r '.resources[].url' | sed 's/^/路由: /'
+          sleep 5
+          code=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 30 "https://${{ inputs.hostname }}.${{ inputs.domain }}" || true)
+          echo "HTTP $code"; [ "$code" = "200" ]
