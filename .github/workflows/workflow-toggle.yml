@@ -1,0 +1,31 @@
+name: Enable/disable a workflow in another repo (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: '目标仓库 (owner/name)'
+        required: true
+      workflow:
+        description: '工作流文件名或名称'
+        required: true
+      action:
+        description: 'disable 或 enable'
+        type: choice
+        options: [disable, enable]
+        default: disable
+
+jobs:
+  toggle:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 执行
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -e
+          GH_TOKEN=$(curl -fsSL -H "Authorization: Bearer $PRIVATE_REPO_TOKEN" -H "Accept: application/vnd.github.raw" \
+            https://api.github.com/repos/gxjxzhoo/env-config/contents/.env | grep -m1 '^GH_TOKEN=' | cut -d= -f2-)
+          echo "::add-mask::$GH_TOKEN"; export GH_TOKEN
+          gh workflow ${{ inputs.action }} "${{ inputs.workflow }}" -R "${{ inputs.repo }}"
+          gh workflow list --all -R "${{ inputs.repo }}"
