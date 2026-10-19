@@ -1,0 +1,113 @@
+name: Sync upstream & update SAP new-api
+
+on:
+  schedule:
+    # 每 6 小时同步上游并检查一次（UTC 分钟 23，避开整点）
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重新部署最新版'
+        type: boolean
+        default: false
+
+concurrency:
+  group: sap-newapi-update
+  cancel-in-progress: false
+
+env:
+  CF_API: https://api.cf.ap21.hana.ondemand.com
+  CF_ORG: 1366518btrial
+  CF_SPACE: dev
+  APP_NAME: new-api
+  APP_URL: https://new-api.cfapps.ap21.hana.ondemand.com
+  IMAGE: calciumion/new-api
+  UPSTREAM: QuantumNous/new-api
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      SAP_EMAIL: ${{ secrets.SAP_EMAIL }}
+      SAP_PASSWORD: ${{ secrets.SAP_PASSWORD }}
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+    steps:
+      - name: 同步上游 (fork sync)
+        continue-on-error: true   # 上游改了 workflow 文件时 GITHUB_TOKEN 无权同步，不影响部署判断
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/merge-upstream" -f branch=main | jq -r '.message // .'
+
+      - name: 查询上游最新版本
+        id: upstream
+        run: |
+          TAG=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+            "https://api.github.com/repos/$UPSTREAM/releases/latest" | jq -r .tag_name)
+          [ -n "$TAG" ] && [ "$TAG" != "null" ] || { echo "取不到最新版本"; exit 1; }
+          # 确认 Docker Hub 已有该 tag 镜像（发布后镜像可能晚几分钟）
+          if ! curl -fsS "https://hub.docker.com/v2/repositories/$IMAGE/tags/$TAG" >/dev/null; then
+            echo "Docker Hub 还没有 $IMAGE:$TAG，下次再试"
+            echo "ready=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "上游最新: $TAG"
+
+      - name: 安装 cf CLI 并登录
+        if: steps.upstream.outputs.ready == 'true'
+        run: |
+          [ -n "$SAP_EMAIL" ] && [ -n "$SAP_PASSWORD" ] || { echo "缺少 Secrets: SAP_EMAIL / SAP_PASSWORD"; exit 1; }
+          curl -fsSL "https://packages.cloudfoundry.org/stable?release=linux64-binary&version=v8&source=github" | sudo tar -zx -C /usr/local/bin cf8 cf
+          cf version
+          cf api "$CF_API"
+          CF_USERNAME="$SAP_EMAIL" CF_PASSWORD="$SAP_PASSWORD" cf auth
+          cf target -o "$CF_ORG" -s "$CF_SPACE"
+
+      - name: 对比当前部署版本
+        id: current
+        if: steps.upstream.outputs.ready == 'true'
+        run: |
+          GUID=$(cf app "$APP_NAME" --guid)
+          CUR=$(cf curl "/v3/apps/$GUID/droplets/current" | jq -r '.image // ""')
+          echo "当前镜像: $CUR"
+          echo "image=$CUR" >> "$GITHUB_OUTPUT"
+          if [ "$CUR" = "$IMAGE:${{ steps.upstream.outputs.tag }}" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "已是最新，无需更新"
+            echo "need=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "need=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 滚动更新（不停机）
+        id: push
+        if: steps.current.outputs.need == 'true'
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          # 不用 manifest，原有环境变量（SQL_DSN、TZ）保持不变
+          cf push "$APP_NAME" --docker-image "$IMAGE:$TAG" -m 1G -k 2G --strategy rolling
+          sleep 10
+          code=000
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 30 "$APP_URL" || true)
+            [ "$code" = "200" ] && break
+            sleep 10
+          done
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          cf app "$APP_NAME"
+          [ "$code" = "200" ] || { echo "更新后访问异常: $code"; exit 1; }
+
+      - name: Telegram 通知
+        if: always() && steps.current.outputs.need == 'true'
+        run: |
+          [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || exit 0
+          if [ "${{ steps.push.outcome }}" = "success" ]; then
+            MSG="✅ <b>SAP new-api 已更新</b>%0A版本: ${{ steps.upstream.outputs.tag }}%0A原镜像: ${{ steps.current.outputs.image }}"
+          else
+            MSG="❌ <b>SAP new-api 更新失败</b>%0A目标版本: ${{ steps.upstream.outputs.tag }}%0A请查看 Actions 日志"
+          fi
+          curl -fsS "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+            -d chat_id="$TG_CHAT_ID" -d parse_mode=HTML -d text="$MSG" >/dev/null
